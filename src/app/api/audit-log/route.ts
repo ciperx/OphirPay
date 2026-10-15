@@ -5,12 +5,14 @@ import { successResponse, handleApiError, validationError } from "@/lib/api-resp
 import prisma from "@/lib/prisma";
 import { withRequestLogging } from "@/lib/request-logging";
 import {
-  auditLogQuerySchema,
+  auditLogListQuerySchema,
+  applyAuditCursorPagination,
   parseAuditTimestamp,
   readAuditLogTotalCount,
   readAuditEntryById,
   type AuditLogEntry,
 } from "@/lib/audit-log";
+import { compareAuditEntries } from "@/lib/audit-cursor";
 
 /**
  * GET /api/audit-log
@@ -97,7 +99,7 @@ async function _GET(request: Request) {
       return v == null || v.trim() === "" ? undefined : v;
     };
 
-    const parsed = auditLogQuerySchema.safeParse({
+    const parsed = auditLogListQuerySchema.safeParse({
       page: param("page"),
       limit: param("limit"),
       actor: param("actor"),
@@ -107,10 +109,21 @@ async function _GET(request: Request) {
       until: param("until"),
       order: param("order"),
       source: param("source"),
+      cursor: param("cursor"),
+      sort_by: param("sort_by"),
+      direction: param("direction"),
     });
     if (!parsed.success) return validationError(parsed.error);
 
     const { page, limit, source } = parsed.data;
+    const sortBy = parsed.data.sort_by;
+    const direction = parsed.data.direction ?? parsed.data.order;
+    // Cursor (keyset) mode is activated by an explicit cursor or an explicit
+    // sort request; otherwise the legacy offset behaviour is preserved.
+    const useCursor =
+      param("cursor") != null ||
+      param("sort_by") != null ||
+      param("direction") != null;
     const hasFilters = Boolean(
       parsed.data.actor ||
         parsed.data.action ||
@@ -161,6 +174,30 @@ async function _GET(request: Request) {
         : 0;
 
     if (source === "db") {
+      // Cursor mode: fetch the matching rows (post-filter, sorted stably)
+      // and window them by keyset instead of offset.
+      if (useCursor) {
+        const allRows = (
+          await prisma.auditLog.findMany({ where: dbWhere, orderBy: { createdAt: "desc" } })
+        ).map(mapDbRow);
+        const sortedRows = [...allRows].sort((a, b) =>
+          compareAuditEntries(a, b, sortBy, direction)
+        );
+        const { items, nextCursor, hasMore } = applyAuditCursorPagination(
+          sortedRows,
+          parsed.data.cursor,
+          limit,
+          sortBy
+        );
+        return successResponse(items, {
+          limit,
+          total: dbTotal,
+          sort_by: sortBy,
+          direction,
+          has_more: hasMore,
+          ...(nextCursor ? { next_cursor: nextCursor } : {}),
+        });
+      }
       return successResponse(dbRows, { page, limit, total: dbTotal });
     }
 
@@ -188,7 +225,7 @@ async function _GET(request: Request) {
       return ids;
     };
 
-    const idPool = hasFilters ? ascendingIds(totalCount) : windowIds(totalCount);
+    const idPool = hasFilters || useCursor ? ascendingIds(totalCount) : windowIds(totalCount);
     if (!descending) idPool.reverse();
 
     const entries: AuditLogEntry[] = [];
@@ -204,10 +241,51 @@ async function _GET(request: Request) {
 
     if (!hasFilters) {
       // Unfiltered page window — total is the ledger size.
+      if (useCursor) {
+        const sortedEntries = [...entries].sort((a, b) =>
+          compareAuditEntries(a, b, sortBy, direction)
+        );
+        const { items, nextCursor, hasMore } = applyAuditCursorPagination(
+          sortedEntries,
+          parsed.data.cursor,
+          limit,
+          sortBy
+        );
+        return successResponse(items, {
+          limit,
+          total: totalCount,
+          sort_by: sortBy,
+          direction,
+          has_more: hasMore,
+          ...(nextCursor ? { next_cursor: nextCursor } : {}),
+        });
+      }
       return successResponse(entries, { page, limit, total: totalCount });
     }
 
     // Filtered — slice the page from the matching set (kept in id order).
+    if (useCursor) {
+      const sortedEntries = [...entries].sort((a, b) =>
+        compareAuditEntries(a, b, sortBy, direction)
+      );
+      const { items, nextCursor, hasMore } = applyAuditCursorPagination(
+        sortedEntries,
+        parsed.data.cursor,
+        limit,
+        sortBy
+      );
+      const total = entries.length + (source === "all" ? dbTotal : 0);
+      const data =
+        source === "all" ? [...items, ...dbRows] : items;
+      return successResponse(data, {
+        limit,
+        total,
+        sort_by: sortBy,
+        direction,
+        has_more: hasMore,
+        ...(nextCursor ? { next_cursor: nextCursor } : {}),
+      });
+    }
     const start = (page - 1) * limit;
     const pageItems = entries.slice(start, start + limit);
     const total = entries.length + (source === "all" ? dbTotal : 0);

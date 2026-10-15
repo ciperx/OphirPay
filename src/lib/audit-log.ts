@@ -24,6 +24,13 @@ import {
   CHAIN_READ_SOURCE,
 } from "@/lib/contracts";
 import { cachedRead, readCacheKey, READ_TTL_MS } from "@/lib/api-cache";
+import {
+  decodeAuditCursor,
+  encodeAuditCursor,
+  auditSortKeyValue,
+  AUDIT_LOG_SORT_FIELDS,
+  type AuditLogSortField,
+} from "@/lib/audit-cursor";
 
 export interface AuditLogEntry {
   /** Sequentially-numbered on-chain entry id. */
@@ -107,6 +114,61 @@ export const auditLogQuerySchema = z
       });
     }
   });
+
+export const AUDIT_LOG_DEFAULT_LIMIT = 20;
+export const AUDIT_LOG_MAX_LIMIT = 100;
+
+/** Max `limit` for the audit-log list endpoint (bounty #1361). */
+export const auditLogListQuerySchema = auditLogQuerySchema.extend({
+  // Opaque keyset cursor from a previous response's `meta.next_cursor`.
+  cursor: z
+    .string()
+    .refine((v) => decodeAuditCursor(v) !== null, {
+      message: "Invalid cursor",
+    })
+    .optional(),
+  // Allowlisted sort field; default keeps the existing newest-first order.
+  sort_by: z.enum(AUDIT_LOG_SORT_FIELDS).default("timestamp"),
+  direction: z.enum(["asc", "desc"]).default("desc"),
+});
+
+export type AuditLogListQuery = z.infer<typeof auditLogListQuerySchema>;
+
+/**
+ * Apply cursor (keyset) pagination to an already-sorted entry list.
+ *
+ * The cursor identifies the last row of the previous page; the next page
+ * starts strictly after it under the requested ordering. Because ordering is
+ * fully determined by (sort field, direction, id tiebreaker), pages are
+ * stable even when new entries are written between requests.
+ */
+export function applyAuditCursorPagination<T extends { id: number | string }>(
+  sorted: T[],
+  cursor: string | undefined,
+  limit: number,
+  sortBy: AuditLogSortField
+): { items: T[]; nextCursor: string | null; hasMore: boolean } {
+  let start = 0;
+  if (cursor) {
+    const payload = decodeAuditCursor(cursor)!;
+    const idx = sorted.findIndex((e) => String(e.id) === payload.id);
+    start = idx === -1 ? sorted.length : idx + 1;
+  }
+  const items = sorted.slice(start, start + limit);
+  const hasMore = start + limit < sorted.length;
+  const last = items[items.length - 1];
+  return {
+    items,
+    nextCursor:
+      hasMore && last
+        ? encodeAuditCursor({
+            k: auditSortKeyValue(last as never, sortBy),
+            id: String(last.id),
+          })
+        : null,
+    hasMore,
+  };
+}
 
 export type AuditLogQuery = z.infer<typeof auditLogQuerySchema>;
 

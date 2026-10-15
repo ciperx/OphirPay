@@ -22,6 +22,11 @@ interface ApiSuccess<T> {
     nextCursor?: string | null;
     /** Whether more rows exist after this page. */
     hasMore?: boolean;
+    /** Cursor pagination metadata for the audit-log API (#1361). */
+    next_cursor?: string | null;
+    has_more?: boolean;
+    sort_by?: string;
+    direction?: "asc" | "desc";
     /**
      * True when a reader had to cap its result set (#742). Mirrors the
      * `truncated` flag on the on-chain `PaymentList` / `HookList` readers and
